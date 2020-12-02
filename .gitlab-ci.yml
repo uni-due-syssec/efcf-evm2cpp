@@ -1,0 +1,157 @@
+stages:
+  - debug-build
+  - misc-build
+  - test
+  - docker-build
+  - integration-test
+  - test-nightly
+  - doc-pages
+
+image: rust:latest
+
+cache:
+  paths:
+    - target/
+
+variables:
+  RUST_BACKTRACE: full
+  GIT_SUBMODULE_STRATEGY: recursive
+  EVM_PATH: ${CI_PROJECT_URL}/../eEVM/
+
+build:
+  stage: debug-build
+  script:
+    - cargo build --verbose
+
+docs: &docs
+  stage: misc-build
+  needs: ["build"]
+  script:
+    - cargo doc --verbose
+  artifacts:
+    paths:
+      - target/doc/
+    expire_in: 1 week
+  when: always
+
+pages:
+  stage: doc-pages
+  needs: ["docs"]
+  when: always
+  only:
+    - master
+  script:
+    - cp -r target/doc public || (cargo doc && cp -r target/doc public)
+  artifacts:
+    paths:
+      - public/
+    expire_in: 1 week
+
+test:
+  stage: test
+  needs: ["build"]
+  script:
+    - rustc --version && cargo --version
+    - cargo test --all --verbose
+
+integration-test:
+  stage: integration-test
+  needs: ["build"]
+
+  before_script:
+    - wget --quiet -O /usr/local/bin/solc-0.7.6 https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.7.6+commit.7338295f
+    - wget --quiet -O /usr/local/bin/solc-0.4.23 https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.4.23+commit.124ca40d
+    - chmod +x /usr/local/bin/solc*
+
+  script:
+    - "# compile code"
+    - cargo build --quiet
+    - "# compile some test artifacts"
+    - cd contracts
+    - solc-0.7.6 --bin --bin-runtime --abi --hashes -o . --overwrite crowdsale.sol
+    - test -e Crowdsale.bin-runtime
+    - solc-0.4.23 --combined-json abi,bin,bin-runtime,srcmap,srcmap-runtime -o . --overwrite SMT.sol
+    - test -e combined.json
+    - mv combined.json SMT.combined.json
+    - cd ..
+    - "# create dummy eEVM directory structure"
+    - "rm -rf eEVM || true"
+    - mkdir -p ./eEVM/contracts ./eEVM/fuzz/dict ./eEVM/fuzz/abi ./eEVM/include/eEVM/evm2cpp/ ./eEVM/include/eEVM/evm2cpp/contracts/
+    - touch eEVM/include/eEVM/evm2cpp/contracts.h
+    - ls -R eEVM
+    - "# testing translate single from bytecode"
+    - cargo run -- -a ./contracts/Crowdsale.abi crowdsale ./contracts/Crowdsale.bin-runtime
+    - test -e eEVM/contracts/crowdsale.cpp
+    - test -e eEVM/contracts/crowdsale.bb_list
+    - test -e eEVM/fuzz/abi/crowdsale.abi
+    - test -e eEVM/fuzz/dict/crowdsale.dict
+    - "# create dummy eEVM directory structure"
+    - rm -rf eEVM
+    - mkdir -p ./eEVM/contracts ./eEVM/fuzz/dict ./eEVM/fuzz/abi ./eEVM/include/eEVM/evm2cpp/ ./eEVM/include/eEVM/evm2cpp/contracts/
+    - touch eEVM/include/eEVM/evm2cpp/contracts.h
+    - "# testing translate all"
+    - cargo run -- -A ./contracts/SMT.combined.json
+    - ls -R eEVM
+    - test -e eEVM/contracts/SMT.cpp
+    - test -e eEVM/contracts/SMT.bb_list
+    - test -e eEVM/fuzz/abi/SMT.abi
+    - test -e eEVM/fuzz/dict/SMT.dict
+    - test -e eEVM/contracts/StandardToken.cpp
+    - test -e eEVM/contracts/StandardToken.bb_list
+    - test -e eEVM/fuzz/abi/StandardToken.abi
+    - test -e eEVM/fuzz/dict/StandardToken.dict
+    - "# create dummy eEVM directory structure"
+    - rm -rf eEVM
+    - mkdir -p ./eEVM/contracts ./eEVM/fuzz/dict ./eEVM/fuzz/abi ./eEVM/include/eEVM/evm2cpp/ ./eEVM/include/eEVM/evm2cpp/contracts/ 
+    - touch eEVM/include/eEVM/evm2cpp/contracts.h
+    - "# testing translate single from combined json (with slightly different name)"
+    - cargo run -- smt_small ./contracts/SMT.combined.json
+    - test -e eEVM/contracts/smt_small.cpp
+    - test -e eEVM/contracts/smt_small.bb_list
+    - test -e eEVM/fuzz/abi/smt_small.abi
+    - test -e eEVM/fuzz/dict/smt_small.dict
+
+audit:
+  stage: test
+  needs: ["build"]
+  before_script:
+    - cargo install --force cargo-audit
+  script:
+    - test -e Cargo.lock || cargo generate-lockfile
+    - cargo check --verbose
+    - cargo audit
+
+test-nightly:
+  stage: test-nightly
+  needs: ["build"]
+  image: rustlang/rust:nightly
+  script:
+    - cargo install --force grcov
+    - cargo clean
+    - rustc --version && cargo --version
+    - cargo test --all --verbose
+    - cargo clean
+    - export CARGO_INCREMENTAL="0"
+    - export RUSTFLAGS="-Zprofile -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort"
+    - export RUSTDOCFLAGS="-Cpanic=abort"
+    - cargo build --quiet
+    - cargo test --quiet
+    - grcov ./target/debug/ -s . -t html --llvm --branch --ignore-not-existing -o ./target/debug/coverage/
+  artifacts:
+    paths:
+      - target/debug/coverage/
+
+test-miri:
+  stage: test-nightly
+  needs: ["build"]
+
+  before_script:
+    - 'export MIRI_NIGHTLY=nightly-$(curl -s https://rust-lang.github.io/rustup-components-history/x86_64-unknown-linux-gnu/miri)'
+    - "echo Installing latest nightly with Miri: $MIRI_NIGHTLY"
+    - rustup set profile minimal
+    - "rustup default \"$MIRI_NIGHTLY\""
+    - rustup component add miri
+
+  script:
+    - rustc --version; cargo --version; cargo miri --version
+    - cargo miri test
